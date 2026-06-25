@@ -35,6 +35,7 @@ def generate_launch_description():
     autostart = LaunchConfiguration('autostart')
     params_file = LaunchConfiguration('params_file')
     use_composition = LaunchConfiguration('use_composition')
+    use_scan_filter = LaunchConfiguration('use_scan_filter')
     container_name = LaunchConfiguration('container_name')
     container_name_full = (namespace, '/', container_name)
     use_respawn = LaunchConfiguration('use_respawn')
@@ -118,6 +119,12 @@ def generate_launch_description():
         'log_level', default_value='info', description='log level'
     )
 
+    declare_use_scan_filter_cmd = DeclareLaunchArgument(
+        'use_scan_filter', default_value='true',
+        description='Run the laser_filters scan body filter (simulation). Set false on '
+                    'the real robot, where openamrobot_perception publishes /scan_filtered.'
+    )
+
     scan_filter_config = os.path.join(bringup_dir, 'config', 'scan_body_filter.yaml')
 
     load_nodes = GroupAction(
@@ -130,6 +137,7 @@ def generate_launch_description():
                 name='scan_body_filter',
                 parameters=[scan_filter_config],
                 remappings=[('scan', '/scan'), ('scan_filtered', '/scan_filtered')],
+                condition=IfCondition(use_scan_filter),
             ),
             Node(
                 package='nav2_controller',
@@ -290,6 +298,7 @@ def generate_launch_description():
     ld.add_action(declare_container_name_cmd)
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_log_level_cmd)
+    ld.add_action(declare_use_scan_filter_cmd)
     # Add the actions to launch all of the navigation nodes
     ld.add_action(load_nodes)
     ld.add_action(load_composable_nodes)
