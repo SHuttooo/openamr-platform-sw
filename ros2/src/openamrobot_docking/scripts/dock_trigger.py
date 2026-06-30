@@ -49,6 +49,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from std_msgs.msg import Bool, String
+from std_srvs.srv import SetBool
 from geometry_msgs.msg import Point, PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
 from nav2_msgs.action import (
@@ -113,10 +114,12 @@ class DockTrigger(Node):
         self.declare_parameter('undock_reverse_distance', 1.5)   # m straight back
         self.declare_parameter('undock_reverse_speed', 0.10)     # m/s (magnitude)
 
-        # Dock pose in map frame (must match nav2_sim_full.yaml docks/home_dock)
-        self.declare_parameter('dock_pose_x', 0.0)
-        self.declare_parameter('dock_pose_y', 4.9)
-        self.declare_parameter('dock_pose_yaw', 1.5707)
+        # Dock pose in map frame. Defaults ALIGNED with config/dock_trigger.yaml (sim dock at the
+        # +X wall) so a stray standalone launch can't drive to a contradictory hard-coded pose.
+        # The REAL dock pose MUST be measured in your real map and set in dock_trigger.yaml (B2).
+        self.declare_parameter('dock_pose_x', 4.899)
+        self.declare_parameter('dock_pose_y', 0.0)
+        self.declare_parameter('dock_pose_yaw', 0.0)
 
         # Staging
         self.declare_parameter('staging_distance', 1.5)        # m in front of dock
@@ -190,6 +193,17 @@ class DockTrigger(Node):
         # Tag detection
         self.declare_parameter('detection_topic', '/detected_dock_pose')
         self.declare_parameter('detection_max_age', 1.5)       # s — drop stale msgs
+
+        # ── On-demand AprilTag image gate (real robot) ─────────────────────
+        # apriltag_node is CPU-heavy (~1.6 cores on the Pi) and only needed for
+        # the final dock approach. The gate (openamrobot_docking/apriltag_gate.py)
+        # (un)subscribes the camera feed to apriltag via this SetBool service, so
+        # apriltag idles at ~0% CPU during navigation and toggles instantly (it
+        # stays alive). We ENABLE it once at the staging zone and DISABLE it when
+        # the sequence ends. Disabled by default (sim has apriltag always-on and
+        # no gate service); docking_real.launch.py opts in with use_apriltag_gate.
+        self.declare_parameter('use_apriltag_gate', False)
+        self.declare_parameter('apriltag_gate_service', '/apriltag/set_enabled')
 
         # Temporal filtering of tag pose: collect N samples, average them
         self.declare_parameter('filter_num_samples', 20)
@@ -268,6 +282,11 @@ class DockTrigger(Node):
         # you must fall back to /scan — and then pick a value clearly
         # below the closest legitimate obstacle distance.
         self.declare_parameter('obstacle_min_range', 0.0)               # m — 0 = disabled
+        # Scan-frame angle that points to the robot's FORWARD. 0.0 in sim (lidar aligned with
+        # base_link). On THIS real robot the RPLIDAR is mounted rotated 180° (yaw=π), so scan
+        # angle 0 points BACKWARD — set this to 3.14159 in the real dock_trigger.yaml, otherwise
+        # the forward obstacle cone watches the rear and the robot drives in blind.
+        self.declare_parameter('obstacle_scan_forward_angle', 0.0)      # rad (real robot: 3.14159)
 
         self.trigger_topic = self.get_parameter('trigger_topic').value
         self.undock_on_false = self.get_parameter('undock_on_false').value
@@ -301,6 +320,8 @@ class DockTrigger(Node):
         self.spin_yaw_tolerance = float(self.get_parameter('spin_yaw_tolerance').value)
         self.detection_topic = self.get_parameter('detection_topic').value
         self.detection_max_age = float(self.get_parameter('detection_max_age').value)
+        self.use_apriltag_gate = bool(self.get_parameter('use_apriltag_gate').value)
+        self.apriltag_gate_service = self.get_parameter('apriltag_gate_service').value
         self.filter_num_samples = int(self.get_parameter('filter_num_samples').value)
         self.filter_max_collect_time = float(self.get_parameter('filter_max_collect_time').value)
         self.publish_debug_markers = bool(self.get_parameter('publish_debug_markers').value)
@@ -327,6 +348,8 @@ class DockTrigger(Node):
         self.obstacle_wait_timeout = float(self.get_parameter('obstacle_wait_timeout').value)
         self.obstacle_check_period = float(self.get_parameter('obstacle_check_period').value)
         self.obstacle_min_range = float(self.get_parameter('obstacle_min_range').value)
+        self.obstacle_scan_forward_angle = float(
+            self.get_parameter('obstacle_scan_forward_angle').value)
 
         # ── Multi-threaded callback group so the long-running sequence can
         #    run while subscriptions and TF still get processed. ────────────
@@ -337,6 +360,10 @@ class DockTrigger(Node):
                                        callback_group=self.cb_group)
         self.undock_client = ActionClient(self, UndockRobot, 'undock_robot',
                                           callback_group=self.cb_group)
+
+        # ── On-demand AprilTag gate client (real robot; see _set_apriltag) ──
+        self._apriltag_gate_cli = self.create_client(
+            SetBool, self.apriltag_gate_service, callback_group=self.cb_group)
 
         # ── cmd_vel publisher (closed-loop drive phase) ────────────────────
         self.cmd_vel_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
@@ -371,6 +398,14 @@ class DockTrigger(Node):
         # ── Goal-pose gate publisher (forwards to Nav2 after undock) ────────
         self.goal_pose_pub = self.create_publisher(
             PoseStamped, self.goal_pose_forward_topic, 10)
+
+        # A6 guard: there must be exactly ONE forwarder on the Nav2 goal topic. If another node
+        # also publishes there (a leftover topic_tools goal relay, or an orphaned dock_trigger from
+        # an incomplete shutdown), every RViz "2D Goal Pose" is published TWICE -> Nav2 receives a
+        # duplicate goal. We can't kill the other node, but we warn loudly so the operator fixes it.
+        # Checked once a few seconds after startup (lets other nodes register first).
+        self._fwd_guard_timer = self.create_timer(
+            4.0, self._check_single_forwarder, callback_group=self.cb_group)
 
         # ── Debug marker publisher (perpendicular line + tag centre) ────────
         self.marker_pub = self.create_publisher(
@@ -419,6 +454,51 @@ class DockTrigger(Node):
         if not self.busy:
             self._pub_status('docked' if self.is_docked else 'idle')
 
+    def _check_single_forwarder(self) -> None:
+        """One-shot A6 guard: warn if more than one node publishes the Nav2 goal topic."""
+        self._fwd_guard_timer.cancel()  # run once only
+        topic = self.goal_pose_pub.topic_name
+        try:
+            n = self.count_publishers(topic)
+        except Exception:
+            return
+        if n > 1:
+            self.get_logger().error(
+                f'DOUBLE FORWARDER: {n} publishers on {topic} (expected 1 = this dock_trigger). '
+                'A leftover goal relay or an orphaned dock_trigger is running -> every goal is sent '
+                'twice. Stop the extra forwarder (only ONE of relay / dock_trigger may run).')
+        else:
+            self.get_logger().info(f'Goal forwarder OK: sole publisher on {topic}.')
+
+    def _set_apriltag(self, enabled: bool) -> None:
+        """Enable/disable the on-demand AprilTag image gate (real robot).
+
+        apriltag_node stays alive; the gate just (un)subscribes the camera feed,
+        so toggling is instant and apriltag burns ~0% CPU while disabled (during
+        navigation). No-op (with a warning) if the gate service is absent — e.g.
+        in simulation, where apriltag is always on and there is no gate.
+        """
+        if not self.use_apriltag_gate:
+            return
+        cli = self._apriltag_gate_cli
+        if not cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn(
+                f"AprilTag gate service '{self.apriltag_gate_service}' unavailable — "
+                f"leaving apriltag as-is (always-on?). "
+                f"Skipping {'enable' if enabled else 'disable'}.")
+            return
+        req = SetBool.Request()
+        req.data = enabled
+        future = cli.call_async(req)
+        # Don't block the sequence on the response — the gate toggles within one
+        # frame regardless. A short wait just confirms the call was accepted (the
+        # MultiThreadedExecutor resolves the future on another thread).
+        t0 = time.time()
+        while not future.done() and time.time() - t0 < 1.0:
+            time.sleep(0.02)
+        self.get_logger().info(
+            f"AprilTag gate -> {'ENABLED' if enabled else 'disabled'}")
+
     def on_detection(self, msg: PoseStamped):
         self.detected_pose = msg
 
@@ -443,6 +523,7 @@ class DockTrigger(Node):
         except Exception as e:
             self.get_logger().error(f'Docking sequence error: {e}')
         finally:
+            self._set_apriltag(False)   # apriltag back to ~0% CPU
             self._pub_status('docked' if self.is_docked else 'failed')
             self.busy = False
 
@@ -512,6 +593,12 @@ class DockTrigger(Node):
             return
         self._publish_cmd_vel(0.0, 0.0)
         time.sleep(self.staging_hold_seconds)
+
+        # AprilTag pipeline ON now — it stayed idle during the Nav2 drive to the
+        # staging zone (CPU left free for the planner). Instant: apriltag_node is
+        # already up; the gate just starts forwarding frames. Disabled again in
+        # _run_and_release's finally, whatever the outcome.
+        self._set_apriltag(True)
 
         # See both tags and estimate the dock (centre + normal from baseline).
         if not self._search_for_tag():
@@ -665,7 +752,7 @@ class DockTrigger(Node):
         # drive. This catches "someone is directly in front of the robot when
         # the trigger arrives" up front, before the drive loop starts.
         if not self._wait_for_path_clear(
-            0.0, self.obstacle_forward_distance,
+            self.obstacle_scan_forward_angle, self.obstacle_forward_distance,
             self.obstacle_wait_timeout, 'goto-point pre-check'
         ):
             return False
@@ -1152,7 +1239,7 @@ class DockTrigger(Node):
             # obstacle_forward_distance, stop, wait for it to clear, then
             # resume. If still blocked after obstacle_wait_timeout, abort.
             if not self._wait_for_path_clear(
-                0.0, self.obstacle_forward_distance,
+                self.obstacle_scan_forward_angle, self.obstacle_forward_distance,
                 self.obstacle_wait_timeout, 'forward drive'
             ):
                 self._publish_cmd_vel(0.0, 0.0)
@@ -1510,16 +1597,33 @@ class DockTrigger(Node):
                 return c
         return None
 
-    def _send_action_blocking(self, client, goal) -> bool:
+    def _send_action_blocking(self, client, goal, accept_timeout: float = 10.0,
+                              result_timeout: float = 120.0) -> bool:
+        # Bounded waits: without a deadline a never-returning action (Nav2 stuck, lifecycle
+        # inactive, BT that never finishes) would block the sequence forever, leaving busy=True
+        # permanently so the node ignores every trigger/undock/goal until killed.
         send_future = client.send_goal_async(goal)
+        deadline = time.monotonic() + accept_timeout
         while not send_future.done():
+            if time.monotonic() > deadline:
+                self.get_logger().error('Goal acceptance timed out')
+                return False
             time.sleep(0.05)
         gh = send_future.result()
         if gh is None or not gh.accepted:
             self.get_logger().error('Goal rejected')
             return False
         result_future = gh.get_result_async()
+        deadline = time.monotonic() + result_timeout
         while not result_future.done():
+            if time.monotonic() > deadline:
+                self.get_logger().error(
+                    f'Action result timed out after {result_timeout}s; cancelling')
+                try:
+                    gh.cancel_goal_async()
+                except Exception:
+                    pass
+                return False
             time.sleep(0.05)
         result = result_future.result()
         if result is None:
