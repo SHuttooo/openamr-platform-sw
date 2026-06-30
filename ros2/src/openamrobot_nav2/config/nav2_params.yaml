@@ -13,7 +13,7 @@ amcl:
     global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
-    laser_max_range: 100.0
+    laser_max_range: 12.0   # = portee reelle du RPLIDAR A1 (100 inutile -> faisceaux fantomes)
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
     max_beams: 60
@@ -89,44 +89,57 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
+      # COARSE navigation tolerance (Raj review PR4). Docking precision is SEPARATE and much tighter:
+      # docking_server.docking_threshold=0.05 + dock_trigger.yaml (scan_centring_tolerance 0.035 rad,
+      # spin_yaw_tolerance 0.02 rad, docking_distance 0.15 m). The docking sequencer does NOT use this
+      # nav tolerance, so a loose nav goal does not compromise the dock approach.
       xy_goal_tolerance: 0.35
       yaw_goal_tolerance: 0.35
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
+      # RotationShimController: makes the robot ROTATE toward the path before driving (DWB alone
+      # struggles to turn in place to set off in another direction). DWB remains the sub-controller.
+      plugin: "nav2_rotation_shim_controller::RotationShimController"
+      primary_controller: "dwb_core::DWBLocalPlanner"
+      angular_dist_threshold: 0.785       # heading error > 45 deg -> turn in place first
+      forward_sampling_distance: 0.5
+      rotate_to_heading_angular_vel: 0.5  # <= max_vel_theta
+      max_angular_accel: 0.5              # gentle in-place pivot (matches acc_lim_theta) -> less nervous turns
+      simulate_ahead_time: 1.0
+      rotate_to_goal_heading: true
       debug_trajectory_details: True
-      min_vel_x: 0.0
+      min_vel_x: -0.05          # small reverse only when stuck (collision_monitor guards the rear ~0.365m)
       min_vel_y: 0.0
-      max_vel_x: 0.16
+      max_vel_x: 0.20          # forward speed (raised 0.12->0.20, the -2.5 braking absorbs the momentum)
       max_vel_y: 0.0
-      max_vel_theta: 2.0
+      max_vel_theta: 0.5       # slow/steady rotation (2.0 was far too much)
       min_speed_xy: 0.0
-      max_speed_xy: 0.5
+      max_speed_xy: 0.20       # aligned with max_vel_x
       min_speed_theta: 0.0
       acc_lim_x: 0.5
       acc_lim_y: 0.0
-      acc_lim_theta: 1.0
-      decel_lim_x: -0.5
-      decel_lim_y: 0.0
-      decel_lim_theta: -1.0
+      acc_lim_theta: 0.5       # 1.0->0.5: gentle angular ramp (matches acc_lim_x) -> turns as smooth as forward
+      decel_lim_x: -2.5        # stronger braking -0.5->-2.5: slows down much earlier to counter
+      decel_lim_y: 0.0         # the heavy robot's inertia (otherwise it overshoots the target)
+      decel_lim_theta: -2.0    # stronger rotation braking -1.0->-2.0: stops the rotation in time
       vx_samples: 20
-      vy_samples: 5
-      vtheta_samples: 20
+      vy_samples: 1            # differential base, max_vel_y=0 (was 5 — Raj review PR4)
+      vtheta_samples: 30       # rotation samples (lowered 40->30: a touch less angular hesitation)
       sim_time: 1.7
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.6
       xy_goal_tolerance: 0.35
-      trans_stopped_velocity: 0.25
+      trans_stopped_velocity: 0.02   # measured odom noise floor (was 0.25 > max_vel_x 0.20 — Raj review PR4)
       short_circuit_trajectory_evaluation: True
       stateful: True
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "ObstacleFootprint", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       BaseObstacle.scale: 5.0
-      BaseObstacle.inflate_cost: true
+      # BaseObstacle.inflate_cost removed: not a Jazzy BaseObstacleCritic parameter (inert) — Raj review PR4
       ObstacleFootprint.scale: 10.0
-      PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.1
+      PathAlign.scale: 16.0    # 32->16: less aggressive heading-to-path pull (heavy robot was snaking)
+      PathAlign.forward_point_distance: 0.30   # 0.1->0.30: look further ahead -> smoother, less twitchy
+      GoalAlign.scale: 12.0    # 24->12: same, near the goal
+      GoalAlign.forward_point_distance: 0.30
       PathDist.scale: 32.0
       GoalDist.scale: 24.0
       RotateToGoal.scale: 32.0
@@ -174,7 +187,10 @@ local_costmap:
       static_layer:
         plugin: "nav2_costmap_2d::StaticLayer"
         map_subscribe_transient_local: True
-      always_send_full_costmap: False
+      # True: republishes the FULL grid every cycle (publish_frequency) instead of a single
+      # latched send + deltas. Avoids "No map received" in RViz when connecting after
+      # launch / over WiFi (the transient_local sample is not always delivered to the late-joiner).
+      always_send_full_costmap: True
 
 global_costmap:
   global_costmap:
@@ -207,13 +223,15 @@ global_costmap:
           obstacle_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 2.5
-        inflation_radius: 0.20
-      always_send_full_costmap: False
+        cost_scaling_factor: 3.5   # 2.5->3.5: cout retombe plus vite -> halo dur plus mince -> moins de "depart en quasi-collision"/recovery
+        inflation_radius: 0.35   # 0.20->0.35: the GLOBAL PLAN keeps further from the walls (path padding)
+      # True: republishes the FULL grid every cycle (cf local_costmap) -> RViz always has it,
+      # no more "No map received" at launch / over WiFi.
+      always_send_full_costmap: True
 
 map_server:
   ros__parameters:
-    yaml_filename: ""  # Overridden at launch time via the 'map' argument in sim_bringup_launch.py
+    yaml_filename: ""  # Overridden at launch time via the 'map' argument (localization_launch.py / bringup.launch.py)
 
 map_saver:
   ros__parameters:
@@ -299,10 +317,12 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [1.0, 0.0, 2.0]   # Matches gazebo_control.xacro: max_linear_velocity=1.0, max_angular_velocity=2.0
-    min_velocity: [-1.0, 0.0, -2.0]  # Matches gazebo_control.xacro: min_linear_velocity=-1.0, min_angular_velocity=-2.0
-    max_accel: [0.5, 0.0, 1.0]       # Matches gazebo_control.xacro: max_linear_acceleration=0.5, max_angular_acceleration=1.0
-    max_decel: [-0.5, 0.0, -1.0]     # Matches gazebo_control.xacro: min_linear_acceleration=-0.5, min_angular_acceleration=-1.0
+    # Aligned to the SINGLE approved real-robot limit = the DWB limits below (Raj review PR4):
+    # max_velocity matches max_vel_x / max_vel_theta; accel/decel match acc_lim_* / decel_lim_*.
+    max_velocity: [0.20, 0.0, 0.5]   # = max_vel_x 0.20, max_vel_theta 0.5
+    min_velocity: [-0.20, 0.0, -0.5]
+    max_accel: [0.5, 0.0, 0.5]       # = acc_lim_x 0.5, acc_lim_theta 0.5
+    max_decel: [-2.5, 0.0, -2.0]     # = decel_lim_x -2.5, decel_lim_theta -2.0
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
