@@ -8,12 +8,17 @@
         # ⚠️ REAL ROBOT: MEASURE your printed tag's black-square edge and set it here
         # (e.g. a 0.10 m printed panel -> 0.08 m black square). Wrong size = wrong dock
         # distance. Placeholder below assumes a 0.10 m panel.
-        size: 0.08
+        size:  0.131
         max_hamming: 0
 
         detector:
-            threads: 2
-            decimate: 1.0       # no decimation — camera resolution is already limited
+            threads: 3
+            decimate: 2.0       # detect quads on a half-res image (~4x faster) then
+                                # refine=True re-fits corners at full res. Fixes the
+                                # backlog: decimate 1.0 ran the 1280x720 quad detector
+                                # at ~8 Hz < camera 15 Hz -> queue built up -> 0.7 s+
+                                # detection latency (growing past detection_max_age ->
+                                # 'tag 1 lost'). Half-res keeps up -> ~1-frame latency.
             blur: 0.0
             refine: True
             sharpening: 0.25
