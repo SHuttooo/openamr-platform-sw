@@ -11,15 +11,18 @@ SLAM / docking stack runs as in simulation -- only the data source differs:
     - robot_localization EKF: wheels + IMU gyro-Z -> /odom + TF odom->base_link
     - measured static TFs for THIS unit (lidar mounted rotated 180 deg)
 
-Use ``use_sim_time:=false`` downstream (real time). See openamrobot_nav2 for the
-real navigation profile (nav2_params_real.yaml + real_bringup_launch.py).
+Use ``use_sim_time:=false`` downstream (real time). The navigation profile is the shared
+``openamrobot_nav2/config/nav2_params.yaml`` (sim and real differ only by ``use_sim_time``).
+For the full stack, prefer the top-level selector ``openamrobot_bringup bringup.launch.py``.
 """
 import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -33,10 +36,11 @@ def _static_tf(name, parent, child, x=0.0, y=0.0, z=0.0, roll=0.0, pitch=0.0, ya
         output='screen')
 
 
-def _include(pkg_share, rel):
-    """Include another package's launch file by share path."""
+def _include(pkg_share, rel, condition=None):
+    """Include another package's launch file by share path (optionally conditional)."""
     return IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(pkg_share, 'launch', rel)))
+        PythonLaunchDescriptionSource(os.path.join(pkg_share, 'launch', rel)),
+        condition=condition)
 
 
 def generate_launch_description():
@@ -46,10 +50,16 @@ def generate_launch_description():
     ekf_params = os.path.join(bringup, 'config', 'ekf.yaml')
 
     return LaunchDescription([
+        # use_camera:=false lightens the load (the IMX708 camera draws heavily on the Pi 5 -> possible
+        # power brownout at startup). Set to false to test motors+lidar alone / weak power supply.
+        DeclareLaunchArgument(
+            'use_camera', default_value='true',
+            description='Launches the IMX708 camera (false = no camera, reduced load).'),
         # --- real data sources (same topics the sim publishes from Gazebo) ---
         _include(drivers, 'drivers.launch.py'),
         _include(perception, 'scan_body_filter.launch.py'),
-        _include(perception, 'camera.launch.py'),
+        _include(perception, 'camera.launch.py',
+                 condition=IfCondition(LaunchConfiguration('use_camera'))),
         # --- odometry fusion: wheels + IMU gyro-Z -> /odom + TF odom->base_link ---
         Node(
             package='robot_localization', executable='ekf_node', name='ekf_filter_node',

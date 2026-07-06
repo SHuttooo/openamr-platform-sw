@@ -41,7 +41,7 @@ def generate_launch_description():
                 'serial_port': lidar,
                 'serial_baudrate': 115200,
                 'frame_id': 'lidar_link',
-                'angle_compensation': True,
+                'angle_compensate': True,   # correct rplidar_ros param name (was angle_compensation — Raj review PR2)
                 'scan_mode': 'Standard',
             }],
             respawn=True, respawn_delay=3.0,

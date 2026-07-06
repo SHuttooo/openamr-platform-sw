@@ -20,6 +20,10 @@
   <!-- openamrobot_gazebo is an OPTIONAL runtime dep (only for sim:=true). It is resolved
        lazily in bringup.launch.py, so a real-only install does not need it; not listed as a
        hard dependency to keep bringup buildable/runnable on the robot without Gazebo. -->
+  <!-- openamrobot_docking is an OPTIONAL runtime dep (real sim:=false with use_docking:=true).
+       Resolved lazily in bringup.launch.py; with use_docking:=false the bringup falls back to a
+       plain goal relay and does not need it. -->
+  <exec_depend>openamrobot_docking</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

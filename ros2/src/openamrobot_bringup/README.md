@@ -29,16 +29,81 @@ ros2 launch openamrobot_bringup bringup.launch.py map:=/path/to/real_map.yaml
 
 `navigation_launch.py` remaps `bt_navigator`'s goal input `goal_pose → goal_pose_nav` so the
 **docking** node can gate `/goal_pose` (undock-before-navigate). So a goal published on
-`/goal_pose` only reaches Nav2 if something forwards it to `/goal_pose_nav`:
+`/goal_pose` only reaches Nav2 if something forwards it to `/goal_pose_nav`. On the **real robot**
+this is controlled by `use_docking`:
 
-- **sim** — the docking node (`openamrobot_docking`, run separately) forwards it.
-- **real** — the docking pipeline is **not ported yet** (Gazebo-wired apriltag), so this launch
-  starts a small `topic_tools relay /goal_pose → /goal_pose_nav` (real profile only). The
-  standard RViz goal tool (publishes `/goal_pose`) therefore works in both profiles.
+- **`use_docking:=true`** (default) — launches `openamrobot_docking/docking_real.launch.py` (AprilTag
+  on the real camera → `/detected_dock_pose`, + `dock_trigger`). `dock_trigger` **owns** `/goal_pose`:
+  it forwards a goal to `/goal_pose_nav` immediately when not docked, or undocks first when docked, and
+  also performs AprilTag docking on `/dock_trigger`. This is the real port of the docking pipeline.
+- **`use_docking:=false`** — nav-only debug: a plain `topic_tools relay /goal_pose → /goal_pose_nav`
+  (no docking). Use when you don't have the physical dock or just want to test navigation.
+- **sim** — same `use_docking` switch: `use_docking:=true` (default) folds the Gazebo docking layer
+  (`openamrobot_docking.launch.py` — apriltag_sim + `dock_trigger`) into `sim:=true`, so one command
+  runs Gazebo + Nav2 + docking. This replaces the legacy `openamrobot_docking/bringup_sim.launch.py`
+  (kept working for backwards compatibility). `use_docking:=false` falls back to the plain relay.
 
-**Roadmap:** once the real AprilTag docking is ported (real camera → apriltag_ros →
-`/detected_dock_pose`), replace the relay with the `dock_trigger` node so the real robot gets
-the full undock-before-navigate gating **and** docking (this is "option B").
+The standard RViz "2D Goal Pose" tool (publishes `/goal_pose`) works in all cases.
+
+> **Real-dock prerequisites** (for `use_docking:=true` to actually dock): a physical dock with the
+> 3-tag 36h11 bundle (IDs 0/1/2); the printed tag size set in
+> `openamrobot_docking/config/tags_36h11.yaml`; the camera calibrated; and the dock pose set in
+> `openamrobot_docking/config/dock_trigger.yaml` for your real map. Without the dock, navigation still
+> works (goals are forwarded) — only docking/undocking is inactive.
+
+## Individual commands (compose the stack by hand)
+
+`bringup.launch.py` is the one-shot command. But you can also launch each **layer in its own
+terminal** to debug or "do what you want" — and pick the forwarder yourself. The layers are the same
+ones `bringup.launch.py` includes; the only rule to respect is the forwarder.
+
+> **THE ONE RULE — exactly one goal forwarder on `/goal_pose_nav`:**
+> nav-only → launch `goal_relay.launch.py`; **OR** docking → launch the docking layer (its
+> `dock_trigger` is the forwarder). **Never both.** As soon as you launch docking, it owns the goal
+> routing, so do **not** also run the relay. `bringup.launch.py` makes this choice for you via
+> `use_docking`; here you make it by hand.
+
+Every terminal first needs the same sourcing + env (`/opt/ros/jazzy`, the workspace `install`,
+`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, `ROS_DOMAIN_ID=0`).
+
+### Simulation — per terminal
+
+```bash
+# T1 — Gazebo (data source + clock)
+ros2 launch openamrobot_gazebo gz_simulator.launch.py gui:=true
+
+# T2 — Nav2 (localization + navigation + RViz), use_sim_time hard-set to true
+ros2 launch openamrobot_nav2 sim_bringup_launch.py use_rviz:=true
+
+# T3 — forwarder: pick EXACTLY ONE
+#   (a) nav-only  — plain relay /goal_pose -> /goal_pose_nav
+ros2 launch openamrobot_bringup goal_relay.launch.py
+#   (b) docking   — apriltag_sim + dock_trigger (dock_trigger IS the forwarder); do NOT run (a)
+ros2 launch openamrobot_docking openamrobot_docking.launch.py
+```
+
+This is exactly what `bringup.launch.py sim:=true` runs in one process (with `use_docking` choosing
+T3a vs T3b). The legacy `openamrobot_docking/bringup_sim.launch.py` chains the same three with delays.
+
+### Real robot — per terminal
+
+```bash
+# T1 — data source (drivers + perception + camera + EKF + static TFs)
+ros2 launch openamrobot_bringup real_bringup.launch.py
+
+# T2 — Nav2 with your real map (AMCL needs a non-empty map)
+ros2 launch openamrobot_nav2 localization_launch.py map:=/path/to/real_map.yaml use_sim_time:=false
+ros2 launch openamrobot_nav2 navigation_launch.py use_sim_time:=false use_scan_filter:=false
+
+# T3 — forwarder: pick EXACTLY ONE
+#   (a) nav-only
+ros2 launch openamrobot_bringup goal_relay.launch.py
+#   (b) docking on the real camera — dock_trigger IS the forwarder; do NOT run (a)
+ros2 launch openamrobot_docking docking_real.launch.py
+```
+
+The detailed real-robot per-terminal procedure (SSH, startup order, all the gotchas) is in
+`docs/procedures/real-robot-runbook.md`.
 
 ## `real_bringup.launch.py`
 
