@@ -64,11 +64,21 @@ class AprilTagGate(Node):
         # detection. Set true for standalone apriltag testing (no dock_trigger).
         self.declare_parameter('start_enabled', False)
         self.declare_parameter('service_name', 'set_enabled')
+        # Throttle: forward at most this many fps to apriltag (drop the rest).
+        # apriltag processes ~10-12 fps on the Pi 5; feeding it the full camera
+        # rate overflows its input queue -> the detections it emits are 300+ ms
+        # stale (backlog). Capping the input near apriltag's capacity keeps the
+        # queue empty -> ~1-frame latency, at FULL resolution (NO precision loss,
+        # unlike lowering the camera resolution). 0 = unthrottled.
+        self.declare_parameter('max_fps', 10.0)
 
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         service_name = self.get_parameter('service_name').value
         self.enabled = bool(self.get_parameter('start_enabled').value)
+        max_fps = float(self.get_parameter('max_fps').value)
+        self._min_interval = (1.0 / max_fps) if max_fps > 0 else 0.0
+        self._last_fwd = None
 
         # RELIABLE everywhere to MATCH the camera (camera_ros publishes RELIABLE
         # KEEP_LAST 1) and apriltag's image_transport subscriber (RELIABLE
@@ -90,8 +100,18 @@ class AprilTagGate(Node):
 
     def _on_image(self, msg):
         # Forward only while enabled; otherwise drop -> apriltag gets nothing.
-        if self.enabled:
-            self.pub.publish(msg)
+        if not self.enabled:
+            return
+        # Throttle to max_fps: drop frames so apriltag is never overfed (which
+        # backs up its input queue and makes its detections stale). Full-res
+        # frames are still forwarded, just fewer of them.
+        if self._min_interval > 0.0:
+            now = self.get_clock().now()
+            if self._last_fwd is not None and \
+                    (now - self._last_fwd).nanoseconds * 1e-9 < self._min_interval:
+                return
+            self._last_fwd = now
+        self.pub.publish(msg)
 
     def on_set_enabled(self, request, response):
         was = self.enabled
