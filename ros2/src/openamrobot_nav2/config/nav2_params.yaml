@@ -85,7 +85,10 @@ controller_server:
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.05
-      movement_time_allowance: 30.0
+      # 30 -> 12 s: declare 'no progress' and run recoveries sooner instead of
+      # sitting stuck for 30 s (a big part of the perceived 'thinking' time,
+      # especially when a wheel drops on the intermittent right-motor fault).
+      movement_time_allowance: 12.0
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -248,13 +251,18 @@ planner_server:
     GridBased:
       plugin: "nav2_smac_planner::SmacPlanner2D"
       tolerance: 0.5
-      downsample_costmap: false
-      downsampling_factor: 1
+      # Plan on a 2x-downsampled grid (0.05 -> 0.10 m): ~4x fewer A* nodes, so the
+      # global plan computes far faster (the 'takes too long to think' at 0.05 m
+      # full-res was the main planner cost). Path is a touch coarser but adequate;
+      # the local costmap (0.05 m) still handles fine obstacle avoidance.
+      downsample_costmap: true
+      downsampling_factor: 2
       use_astar: true
       allow_unknown: true
       max_iterations: 1000000
       max_on_approach_iterations: 1000
-      max_planning_time: 2.0
+      # Cap planning time hard so a hard plan cannot stall the robot for 2 s.
+      max_planning_time: 1.0
       cost_travel_multiplier: 2.0
       use_final_approach_orientation: false
       smoother:
