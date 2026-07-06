@@ -11,8 +11,14 @@ obstacles, then republishes `/scan` as `/scan_filtered`.
 This is the **real-robot** filter. It differs from the **simulation** filter
 (`openamrobot_nav2/config/scan_body_filter.yaml`, a `laser_filters` angular chain) in two
 ways that matter on hardware: it masks **by distance** (keeps real walls behind thin side
-posts) and it publishes **RELIABLE** so the Nav2 costmaps receive the scan. The two are a
-**sim / real profile pair**, not duplicates.
+posts) and it publishes with a QoS **compatible with our Nav2 costmap observation source** so the
+scan is actually delivered. The two are a **sim / real profile pair**, not duplicates.
+
+> **QoS note (corrected):** Nav2 Jazzy does **not** universally require RELIABLE scans — costmap
+> SensorData sources default to BEST_EFFORT. What matters is **endpoint compatibility**: a
+> BEST_EFFORT publisher with a RELIABLE subscriber is silently dropped. Here our costmap source is
+> configured RELIABLE, so we publish RELIABLE to match. Always verify with
+> `ros2 topic info <topic> --verbose`.
 
 ```bash
 ros2 launch openamrobot_perception scan_body_filter.launch.py
@@ -31,13 +37,14 @@ Defaults are calibrated for **this unit's** LiDAR mount (RPLIDAR A1 mounted rota
 |---|---|---|---|---|
 | `scan_in` | string | `/scan` | topic | input LaserScan |
 | `scan_out` | string | `/scan_filtered` | topic | filtered output |
-| `reliable_qos` | bool | `true` | — | publish RELIABLE; **false leaves Nav2 costmaps empty** |
+| `reliable_qos` | bool | `true` | — | RELIABLE to **match our RELIABLE-configured costmap source**; QoS must be endpoint-compatible (verify with `ros2 topic info --verbose`) |
 | `close_max` | double | `0.40` | m | in "close" sectors, only returns nearer than this are removed |
 | `full_mask_sectors_deg` | double[] | `[-45, 49]` | deg | sectors removed at ALL distances (flat `lo,hi,…` pairs) |
 | `close_mask_sectors_deg` | double[] | `[-96,-73, 73,96]` | deg | sectors where only `< close_max` returns are removed |
 
 **Failure modes:** angles too wide -> real walls near the body get blanked (robot blind to
-close obstacles); `reliable_qos: false` -> costmaps stay empty; wrong frame convention (mount
+close obstacles); `reliable_qos: false` -> BEST_EFFORT, incompatible with our RELIABLE costmap
+subscriber -> scan not delivered (match the endpoints, not a universal Nav2 rule); wrong frame convention (mount
 not rotated 180 deg) -> masks the wrong side.
 
 ### Topics / TF

@@ -12,8 +12,10 @@ ROS parameters (angles in degrees, in the LiDAR frame):
   of real walls: only returns closer than ``close_max`` are removed, real walls
   further away in the same direction are kept.
 
-The output is published with RELIABLE QoS so the Nav2 costmaps (which subscribe
-RELIABLE) actually receive it -- a best-effort publisher left the costmaps empty.
+The output QoS must be endpoint-compatible with the costmap observation source. Nav2 does NOT
+universally require RELIABLE (SensorData sources default to BEST_EFFORT); here our costmap source
+is configured RELIABLE, so we publish RELIABLE to match -- a BEST_EFFORT publisher with a RELIABLE
+subscriber is silently dropped (verify with `ros2 topic info --verbose`).
 
 The default angles are calibrated for this unit's LiDAR mount (rotated 180 deg);
 re-measure them if the mount, chassis, or URDF changes.
@@ -27,10 +29,25 @@ from rclpy.qos import (HistoryPolicy, qos_profile_sensor_data, QoSProfile,
 from sensor_msgs.msg import LaserScan
 
 
-def _pairs_rad(flat):
-    """Turn a flat ``[lo1, hi1, lo2, hi2, ...]`` degree list into ``[(lo, hi), ...]`` radians."""
-    return [(math.radians(flat[i]), math.radians(flat[i + 1]))
-            for i in range(0, len(flat) - 1, 2)]
+def _pairs_rad(flat, name='sectors'):
+    """Validate a flat ``[lo1,hi1,lo2,hi2,...]`` degree list and return ``[(lo,hi),...]`` radians.
+
+    Rejects malformed input (Raj review PR1): odd length, non-finite values, and reversed/wrapped
+    pairs (``lo > hi``). Wrap-around sectors are explicitly NOT supported — split them in two.
+    """
+    flat = list(flat or [])
+    if len(flat) % 2 != 0:
+        raise ValueError(f'{name}: needs an even number of values (lo,hi pairs), got {len(flat)}')
+    if any(not math.isfinite(v) for v in flat):
+        raise ValueError(f'{name}: non-finite value in {flat}')
+    pairs = []
+    for i in range(0, len(flat), 2):
+        lo, hi = flat[i], flat[i + 1]
+        if lo > hi:
+            raise ValueError(f'{name}: reversed/wrapped pair ({lo},{hi}); give lo<=hi in degrees '
+                             '(split a wrap-around sector into two pairs)')
+        pairs.append((math.radians(lo), math.radians(hi)))
+    return pairs
 
 
 class ScanBodyFilter(Node):
@@ -50,8 +67,10 @@ class ScanBodyFilter(Node):
         self.close_max = self.get_parameter('close_max').value
         full_deg = self.get_parameter('full_mask_sectors_deg').value
         close_deg = self.get_parameter('close_mask_sectors_deg').value
-        self.full = _pairs_rad(full_deg)
-        self.close = _pairs_rad(close_deg)
+        self.full = _pairs_rad(full_deg, 'full_mask_sectors_deg')
+        self.close = _pairs_rad(close_deg, 'close_mask_sectors_deg')
+        if not math.isfinite(self.close_max) or self.close_max <= 0.0:
+            raise ValueError(f'close_max must be a positive finite distance, got {self.close_max}')
 
         if self.get_parameter('reliable_qos').value:
             pub_qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST,

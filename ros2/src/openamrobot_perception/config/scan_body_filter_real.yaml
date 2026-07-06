@@ -22,4 +22,4 @@ scan_body_filter:
     # Sectors removed at ALL distances (flat [lo1, hi1, lo2, hi2, ...] degrees).
     full_mask_sectors_deg: [-45.0, 49.0]
     # Sectors where only close (< close_max) returns are removed.
-    close_mask_sectors_deg: [-96.0, -73.0, 73.0, 96.0]
+    close_mask_sectors_deg: [-108.0, -73.0, 73.0, 96.0]
